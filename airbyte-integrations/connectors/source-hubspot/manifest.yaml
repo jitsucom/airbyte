@@ -750,7 +750,7 @@ definitions:
         $ref: "#/schemas/email_subscriptions"
 
   deals_stream:
-    $ref: "#/definitions/base_crm_search_incremental_stream"
+    $ref: "#/definitions/base_crm_search_incremental_deletion_stream"
     transformations:
       - type: CustomTransformation
         class_name: source_declarative_manifest.components.NewtoLegacyFieldTransformation
@@ -868,6 +868,7 @@ definitions:
       - type: InlineSchemaLoader
         schema:
           $ref: "#/schemas/deals_archived"
+
 
   forms_stream:
     primary_key:
@@ -1662,6 +1663,65 @@ definitions:
       cursor_granularity: PT0.001S
       lookback_window: PT{{ config.get('lookback_window', 0) }}M
 
+  # Same as base_crm_search_incremental_stream, but the retriever also emits ARCHIVED
+  # (deleted) objects as tombstone records in the same stream (see HubspotDeletionRetriever).
+  # A stream opts in by `$ref`-ing this definition instead of base_crm_search_incremental_stream.
+  #
+  # The archived list endpoint is /crm/v3/objects/<objectType>?archived=true and the property
+  # list is /properties/v2/<objectType>/properties. For all currently-wired objects the search
+  # `entity` param doubles as the object type, so it is the default; a stream can override with
+  # `archived_object_path` / `archived_properties_object` in its $parameters if they differ.
+  base_crm_search_incremental_deletion_stream:
+    $ref: "#/definitions/base_crm_search_incremental_stream"
+    retriever:
+      type: CustomRetriever
+      class_name: source_declarative_manifest.components.HubspotDeletionRetriever
+      # Live behavior is exactly base_crm_search_incremental_stream's retriever.
+      live_retriever:
+        $ref: "#/definitions/base_crm_search_incremental_stream/retriever"
+      # Archived companies/contacts/deals/... : LIST endpoint with archived=true, fetching the
+      # full property set so tombstones carry the same properties_* columns as live records.
+      archived_retriever:
+        type: SimpleRetriever
+        requester:
+          $ref: "#/definitions/base_requester"
+          path: "/crm/v3/objects/{{ parameters.get('archived_object_path') or parameters['entity'] }}"
+          request_parameters:
+            archived: "true"
+            properties:
+              type: QueryProperties
+              property_list:
+                type: PropertiesFromEndpoint
+                property_field_path:
+                  - name
+                retriever:
+                  type: SimpleRetriever
+                  requester:
+                    $ref: "#/definitions/base_requester"
+                    path: "/properties/v2/{{ parameters.get('archived_properties_object') or parameters['entity'] }}/properties"
+                  decoder:
+                    type: JsonDecoder
+                  record_selector:
+                    type: RecordSelector
+                    extractor:
+                      type: DpathExtractor
+                      field_path: []
+              property_chunking:
+                type: PropertyChunking
+                property_limit_type: characters
+                property_limit: 15000
+                record_merge_strategy:
+                  type: GroupByKeyMergeStrategy
+                  key: id
+        paginator:
+          $ref: "#/definitions/cursor_paginator"
+        record_selector:
+          type: RecordSelector
+          extractor:
+            type: DpathExtractor
+            field_path:
+              - results
+
   base_crm_search_incremental_parent_stream:
     primary_key:
       - id
@@ -1717,7 +1777,7 @@ definitions:
       lookback_window: PT{{ config.get('lookback_window', 0) }}M
 
   companies_stream:
-    $ref: "#/definitions/base_crm_search_incremental_stream"
+    $ref: "#/definitions/base_crm_search_incremental_deletion_stream"
     $parameters:
       name: companies
       entity: company
@@ -1732,7 +1792,7 @@ definitions:
       - $ref: "#/definitions/base_dynamic_schema_loader"
 
   engagements_calls_stream:
-    $ref: "#/definitions/base_crm_search_incremental_stream"
+    $ref: "#/definitions/base_crm_search_incremental_deletion_stream"
     $parameters:
       name: engagements_calls
       entity: calls
@@ -1750,7 +1810,7 @@ definitions:
       - $ref: "#/definitions/base_dynamic_schema_loader"
 
   engagements_emails_stream:
-    $ref: "#/definitions/base_crm_search_incremental_stream"
+    $ref: "#/definitions/base_crm_search_incremental_deletion_stream"
     $parameters:
       name: engagements_emails
       entity: emails
@@ -1786,7 +1846,7 @@ definitions:
       - $ref: "#/definitions/base_dynamic_schema_loader"
 
   engagements_notes_stream:
-    $ref: "#/definitions/base_crm_search_incremental_stream"
+    $ref: "#/definitions/base_crm_search_incremental_deletion_stream"
     $parameters:
       name: engagements_notes
       entity: notes
@@ -1804,7 +1864,7 @@ definitions:
       - $ref: "#/definitions/base_dynamic_schema_loader"
 
   engagements_tasks_stream:
-    $ref: "#/definitions/base_crm_search_incremental_stream"
+    $ref: "#/definitions/base_crm_search_incremental_deletion_stream"
     $parameters:
       name: engagements_tasks
       entity: tasks
@@ -2044,7 +2104,7 @@ definitions:
           $ref: "#/schemas/line_items"
 
   contacts_stream:
-    $ref: "#/definitions/base_crm_search_incremental_stream"
+    $ref: "#/definitions/base_crm_search_incremental_deletion_stream"
     transformations:
       - type: CustomTransformation
         class_name: source_declarative_manifest.components.NewtoLegacyFieldTransformation
@@ -2094,7 +2154,7 @@ definitions:
       - $ref: "#/definitions/base_dynamic_schema_loader"
 
   leads_stream:
-    $ref: "#/definitions/base_crm_search_incremental_stream"
+    $ref: "#/definitions/base_crm_search_incremental_deletion_stream"
     $parameters:
       name: leads
       entity: leads
@@ -3296,6 +3356,22 @@ schemas:
         type:
           - "null"
           - boolean
+      archivedAt:
+        description: Date and time when the company was archived (deleted), if applicable
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
+      _ab_cdc_deleted_at:
+        description: >-
+          CDC deletion marker. Non-null on tombstone records emitted for archived
+          (deleted) companies; equals archivedAt (fallback createdAt).
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
       contacts:
         description: List of contacts associated with the company
         type:
@@ -3365,6 +3441,22 @@ schemas:
       - "null"
       - object
     properties:
+      archivedAt:
+        description: Date and time when the record was archived (deleted), if applicable
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
+      _ab_cdc_deleted_at:
+        description: >-
+          CDC deletion marker. Non-null on tombstone records emitted for archived
+          (deleted) records; equals archivedAt (fallback createdAt).
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
       id:
         description: Unique identifier for the contact.
         type:
@@ -3521,6 +3613,22 @@ schemas:
       - "null"
       - object
     properties:
+      archivedAt:
+        description: Date and time when the record was archived (deleted), if applicable
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
+      _ab_cdc_deleted_at:
+        description: >-
+          CDC deletion marker. Non-null on tombstone records emitted for archived
+          (deleted) records; equals archivedAt (fallback createdAt).
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
       id:
         description: Unique identifier for the deal
         type:
@@ -4552,6 +4660,22 @@ schemas:
       - "null"
       - object
     properties:
+      archivedAt:
+        description: Date and time when the record was archived (deleted), if applicable
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
+      _ab_cdc_deleted_at:
+        description: >-
+          CDC deletion marker. Non-null on tombstone records emitted for archived
+          (deleted) records; equals archivedAt (fallback createdAt).
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
       id:
         description: Unique identifier for the call engagement.
         type:
@@ -4619,6 +4743,22 @@ schemas:
       - "null"
       - object
     properties:
+      archivedAt:
+        description: Date and time when the record was archived (deleted), if applicable
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
+      _ab_cdc_deleted_at:
+        description: >-
+          CDC deletion marker. Non-null on tombstone records emitted for archived
+          (deleted) records; equals archivedAt (fallback createdAt).
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
       id:
         description: Unique identifier for the engagement email
         type:
@@ -4753,6 +4893,22 @@ schemas:
       - "null"
       - object
     properties:
+      archivedAt:
+        description: Date and time when the record was archived (deleted), if applicable
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
+      _ab_cdc_deleted_at:
+        description: >-
+          CDC deletion marker. Non-null on tombstone records emitted for archived
+          (deleted) records; equals archivedAt (fallback createdAt).
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
       id:
         description: Unique identifier for the engagement note
         type:
@@ -4820,6 +4976,22 @@ schemas:
       - "null"
       - object
     properties:
+      archivedAt:
+        description: Date and time when the record was archived (deleted), if applicable
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
+      _ab_cdc_deleted_at:
+        description: >-
+          CDC deletion marker. Non-null on tombstone records emitted for archived
+          (deleted) records; equals archivedAt (fallback createdAt).
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
       id:
         description: Unique identifier for the task
         type:
@@ -5249,6 +5421,22 @@ schemas:
       - "null"
       - object
     properties:
+      archivedAt:
+        description: Date and time when the record was archived (deleted), if applicable
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
+      _ab_cdc_deleted_at:
+        description: >-
+          CDC deletion marker. Non-null on tombstone records emitted for archived
+          (deleted) records; equals archivedAt (fallback createdAt).
+        type:
+          - "null"
+          - string
+        format: date-time
+        __ab_apply_cast_datetime: false
       id:
         description: Unique identifier for the lead
         type:
