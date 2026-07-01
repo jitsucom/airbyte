@@ -3,6 +3,7 @@
 #
 
 import logging
+import threading
 from dataclasses import InitVar, dataclass, field
 from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Union
@@ -37,6 +38,7 @@ from airbyte_cdk.sources.declarative.requesters.error_handlers.http_response_fil
 from airbyte_cdk.sources.declarative.requesters.paginators.strategies.pagination_strategy import PaginationStrategy
 from airbyte_cdk.sources.declarative.requesters.request_options import InterpolatedRequestOptionsProvider
 from airbyte_cdk.sources.declarative.requesters.requester import Requester
+from airbyte_cdk.sources.declarative.retrievers.retriever import Retriever
 from airbyte_cdk.sources.declarative.schema.schema_loader import SchemaLoader
 from airbyte_cdk.sources.declarative.transformations import RecordTransformation
 from airbyte_cdk.sources.streams.http.error_handlers.response_models import ErrorResolution, ResponseAction
@@ -780,6 +782,116 @@ def build_associations_retriever(
         config=config,
         parameters=parameters,
     )
+
+
+@dataclass
+class HubspotDeletionRetriever(Retriever):
+    """
+    Retriever for CRM Search streams (e.g. `companies`, `deals`, `contacts`) that, in addition
+    to the live records returned by the `POST /crm/v3/objects/<entity>/search` endpoint, emits
+    tombstone records for ARCHIVED (deleted) objects fetched from the CRM list endpoint
+    (`GET /crm/v3/objects/<entity>?archived=true`).
+
+    The `/search` endpoint never returns archived records, so deleted objects are otherwise
+    invisible on incremental syncs. Each archived object is emitted once per sync as a tombstone
+    that carries the same primary key `id` and the SAME full set of flattened `properties_*`
+    columns as a live record (so the destination's merge does not NULL-overwrite those columns),
+    plus:
+      - `_ab_cdc_deleted_at` = archivedAt (fallback createdAt)
+      - `updatedAt`          = archivedAt (so the tombstone sorts after the live row for
+                               downstream primary-key dedup)
+
+    Design
+    ------
+    This is a thin wrapper that delegates the live read to a fully-built nested `live_retriever`
+    (a `SimpleRetriever` created through the normal factory so it keeps all of its wiring:
+    query-property fetching/chunking, decoder, pagination, cursor, etc.) and performs an extra
+    archived pass through a nested `archived_retriever`. Subclassing `SimpleRetriever` directly
+    and swapping the manifest `type` was rejected because the generic custom-component builder
+    bypasses `create_simple_retriever` and drops that wiring.
+
+    Single emission
+    ---------------
+    This source runs on the concurrent path (ConcurrentDeclarativeSource). There, one shared
+    retriever instance serves every partition (time slice) and `read_records` is called once per
+    slice. A lock-guarded flag guarantees the archived pass runs exactly once per sync, regardless
+    of how many live slices/threads are in play.
+    """
+
+    live_retriever: Retriever
+    config: Config
+    parameters: InitVar[Mapping[str, Any]]
+    archived_retriever: Optional[Retriever] = None
+    deletion_marker_field: str = "_ab_cdc_deleted_at"
+    deletion_cursor_field: str = "archivedAt"
+
+    def __post_init__(self, parameters: Mapping[str, Any]) -> None:
+        self._parameters = parameters
+        self._archived_lock = threading.Lock()
+        self._archived_emitted = False
+        # Reused to normalize archived records against the (dynamic) stream schema, exactly
+        # like the live record selector does for live records.
+        self._entity_normalizer = EntitySchemaNormalization()
+
+    def read_records(
+        self,
+        records_schema: Mapping[str, Any],
+        stream_slice: Optional[StreamSlice] = None,
+    ) -> Iterable[Any]:
+        # 1) Live records for this slice (unchanged behavior).
+        yield from self.live_retriever.read_records(records_schema, stream_slice=stream_slice)
+
+        # 2) Archived (tombstone) records: emit exactly once per sync, on whichever slice
+        #    wins the flag first.
+        if self.archived_retriever is None:
+            return
+        with self._archived_lock:
+            if self._archived_emitted:
+                return
+            self._archived_emitted = True
+        # The archived list endpoint is not available for every object type / scope (e.g.
+        # HubSpot returns 403 or "Paging through deleted objects is not yet supported" for
+        # some objects). Never let that fail the live sync: log and continue with no tombstones.
+        try:
+            yield from self._read_archived_records(records_schema)
+        except Exception as exc:  # noqa: BLE001 - deletion capture is best-effort
+            logger.warning(
+                "Archived (deletion) pass failed; continuing without tombstones. Error: %s",
+                exc,
+            )
+
+    def _read_archived_records(self, records_schema: Mapping[str, Any]) -> Iterable[Any]:
+        # A single empty slice: the archived retriever paginates the whole archived set.
+        archived_slice = StreamSlice(partition={}, cursor_slice={})
+        for item in self.archived_retriever.read_records(records_schema, stream_slice=archived_slice):
+            data = item.data if isinstance(item, Record) else item
+            if not isinstance(data, Mapping):
+                # Non-record message (log/state/etc.) - pass through untouched.
+                yield item
+                continue
+            yield self._to_tombstone(dict(data), records_schema)
+
+    def _to_tombstone(self, data: Dict[str, Any], records_schema: Mapping[str, Any]) -> Dict[str, Any]:
+        # Flatten `properties` -> `properties_*` (idempotent; mirrors the live DpathFlattenFields
+        # with delete_origin_value=false so the raw `properties` object is preserved too).
+        self._flatten_properties(data)
+
+        # Backfill the deletion cursor from archivedAt (fallback createdAt) and tag the record.
+        deleted_at = data.get(self.deletion_cursor_field) or data.get("createdAt")
+        data[self.deletion_cursor_field] = deleted_at
+        data[self.deletion_marker_field] = deleted_at
+        data["updatedAt"] = deleted_at
+
+        # Normalize types/datetimes against the stream schema, same as live records.
+        self._entity_normalizer.transform(data, records_schema)
+        return data
+
+    @staticmethod
+    def _flatten_properties(data: Dict[str, Any]) -> None:
+        properties = data.get("properties")
+        if isinstance(properties, Mapping):
+            for key, value in properties.items():
+                data[f"properties_{key}"] = value
 
 
 @dataclass
